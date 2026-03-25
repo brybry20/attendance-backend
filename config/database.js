@@ -1,16 +1,42 @@
 // config/database.js
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const fs = require('fs');
 
-// Use /tmp for SQLite on Render (disk is ephemeral but works)
-const dbPath = path.join(process.env.RENDER ? '/tmp' : __dirname, '../attendance.db');
-const db = new sqlite3.Database(dbPath);
+// Determine database path - use /tmp on Render, local folder otherwise
+let dbPath;
+if (process.env.RENDER) {
+  // On Render, use /tmp directory (writable)
+  dbPath = path.join('/tmp', 'attendance.db');
+} else {
+  // Locally, use the data folder
+  const dataDir = path.join(__dirname, '../data');
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+  dbPath = path.join(dataDir, 'attendance.db');
+}
 
 console.log(`Database path: ${dbPath}`);
 
+const db = new sqlite3.Database(dbPath, (err) => {
+  if (err) {
+    console.error('Error opening database:', err.message);
+  } else {
+    console.log('Database connected successfully');
+  }
+});
+
+// Create tables if not exists
 db.serialize(() => {
-  db.run(`DROP TABLE IF EXISTS attendance`);
+  // Drop old attendance table to recreate with new schema
+  db.run(`DROP TABLE IF EXISTS attendance`, (err) => {
+    if (err && err.message !== 'SQLITE_ERROR: no such table: attendance') {
+      console.error('Error dropping table:', err);
+    }
+  });
   
+  // Employees table
   db.run(`CREATE TABLE IF NOT EXISTS employees (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE,
@@ -19,6 +45,7 @@ db.serialize(() => {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
   
+  // Attendance table with file_name column
   db.run(`CREATE TABLE IF NOT EXISTS attendance (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_name TEXT NOT NULL,
@@ -41,9 +68,14 @@ db.serialize(() => {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(file_name, employee_name, date)
-  )`);
+  )`, (err) => {
+    if (err) console.error('Error creating attendance table:', err.message);
+  });
   
-  db.run(`CREATE INDEX IF NOT EXISTS idx_attendance_file_name ON attendance(file_name, employee_name, date)`);
+  // Create index for faster sorting
+  db.run(`CREATE INDEX IF NOT EXISTS idx_attendance_file_name ON attendance(file_name, employee_name, date)`, (err) => {
+    if (err) console.error('Error creating index:', err.message);
+  });
   
   console.log('Database initialized');
 });
