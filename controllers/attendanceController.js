@@ -1,7 +1,49 @@
 // controllers/attendanceController.js
 const XLSX = require('xlsx');
-const db = require('../config/database');
-const { getEmployeeType } = require('../config/employees');
+const fs = require('fs');
+const path = require('path');
+const { getEmployeeType, getEmployeePosition, hasOT, getScheduleForEmployee } = require('../config/employees');
+
+// File path for persistence
+const DATA_FILE = path.join(__dirname, '../data/attendance.json');
+
+// Ensure data directory exists
+const dataDir = path.join(__dirname, '../data');
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
+// Load existing data from file
+let uploadedFiles = new Map();
+
+function loadData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      uploadedFiles = new Map(Object.entries(data));
+      console.log(`Loaded ${uploadedFiles.size} files from storage`);
+    }
+  } catch (error) {
+    console.error('Error loading data:', error);
+  }
+}
+
+function saveData() {
+  try {
+    const data = Object.fromEntries(uploadedFiles);
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+    console.log(`Saved ${uploadedFiles.size} files to storage`);
+  } catch (error) {
+    console.error('Error saving data:', error);
+  }
+}
+
+// Load data on startup
+loadData();
+
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
 
 // Helper function to get day of week
 const getDayOfWeek = (dateStr) => {
@@ -11,25 +53,9 @@ const getDayOfWeek = (dateStr) => {
   return days[date.getDay()];
 };
 
-// ============================================
-// HELPER FUNCTIONS
-// ============================================
-
-function getSchedule(employeeType, date) {
-  const dayOfWeek = date.getDay();
-  if (employeeType === 'manager') {
-    return { startTime: "08:00", endTime: "17:00", gracePeriod: 120 };
-  }
-  if (employeeType === 'office') {
-    return { startTime: "08:00", endTime: "17:00", gracePeriod: 15 };
-  }
-  if (employeeType === 'warehouse') {
-    if (dayOfWeek === 1) {
-      return { startTime: "07:00", endTime: "18:00", gracePeriod: 0 };
-    }
-    return { startTime: "07:00", endTime: "17:30", gracePeriod: 0 };
-  }
-  return { startTime: "08:00", endTime: "17:00", gracePeriod: 15 };
+// Get schedule based on employee and date (uses config)
+function getSchedule(employeeType, date, employeeName) {
+  return getScheduleForEmployee(employeeName, date);
 }
 
 function parseDateTime(dateTimeStr) {
@@ -106,17 +132,6 @@ function computeLate(timeIn, scheduleStart, gracePeriod) {
   return 0;
 }
 
-function computeOvertime(timeOut, scheduleEnd, employeeType) {
-  if (employeeType === 'manager') return 0;
-  if (!timeOut) return 0;
-  const endTime = parseTimeToDate(scheduleEnd, timeOut);
-  if (timeOut > endTime) {
-    const diffMinutes = Math.floor((timeOut - endTime) / 60000);
-    if (diffMinutes > 30) return diffMinutes;
-  }
-  return 0;
-}
-
 function computeUndertime(timeOut, scheduleEnd) {
   if (!timeOut) return 0;
   const endTime = parseTimeToDate(scheduleEnd, timeOut);
@@ -161,8 +176,9 @@ function recomputeRecord(record) {
   }
   
   const dateObj = new Date(record.date);
-  const schedule = getSchedule(record.employeeType, dateObj);
+  const schedule = getSchedule(record.employeeType, dateObj, record.name);
   const dayOfWeek = dateObj.getDay();
+  const isRestDay = dayOfWeek === 0 || dayOfWeek === 6; // Saturday or Sunday
   
   let timeInDate = null;
   let timeOutDate = null;
@@ -176,54 +192,78 @@ function recomputeRecord(record) {
     timeOutDate = parseTimeToFullDate(record.timeOut, record.date);
   }
   
-  if (dayOfWeek === 0) {
-    remarks = "SUNDAY";
-  } else if (dayOfWeek === 6) {
-    remarks = "SATURDAY";
+  // Check if missing time-out
+  if (hasTimeIn && !hasTimeOut) {
+    remarks = "NO TIME-OUT";
+    record.timeOut = "";
   }
   
+  // Check if time-in equals time-out (no actual time-out)
   if (hasTimeIn && hasTimeOut && record.timeIn === record.timeOut) {
     remarks = "NO TIME-OUT";
     timeOutDate = null;
     record.timeOut = "";
   }
   
-  if (hasTimeIn && !hasTimeOut) {
-    remarks = "NO TIME-OUT";
-    record.timeOut = "";
-  }
-  
-  const skipComputation = remarks === "SATURDAY" || remarks === "SUNDAY" || remarks === "NO TIME-OUT";
+  // Skip computation for NO TIME-OUT only
+  const skipComputation = remarks === "NO TIME-OUT";
   
   let late = 0;
   let overtime = 0;
   let undertime = 0;
   let overtimeType = "";
+  let workedMinutes = 0;
   
-  if (timeInDate && !skipComputation) {
+  // Compute late if not rest day (regular day)
+  if (timeInDate && !skipComputation && !isRestDay) {
     late = computeLate(timeInDate, schedule.startTime, schedule.gracePeriod);
   }
   
-  if (timeOutDate && !skipComputation) {
+  // Compute worked minutes for rest day
+  if (isRestDay && timeInDate && timeOutDate && !skipComputation) {
+    workedMinutes = Math.floor((timeOutDate - timeInDate) / 60000);
+    
+    // Only count if employee has OT and worked > 30 minutes
+    if (schedule.hasOT && workedMinutes > 30) {
+      overtime = workedMinutes;
+      overtimeType = "RDOT";
+      remarks = `REST DAY OT - ${(workedMinutes / 60).toFixed(2)} hrs`;
+    } else if (schedule.hasOT && workedMinutes <= 30) {
+      remarks = "REST DAY (NO OT - UNDER 30 MINS)";
+    } else {
+      remarks = "REST DAY (NO OT)";
+    }
+  }
+  
+  // Compute regular day overtime
+  if (!isRestDay && timeOutDate && !skipComputation && schedule.hasOT) {
     const endTime = parseTimeToDate(schedule.endTime, timeOutDate);
     if (timeOutDate > endTime) {
       const diffMinutes = Math.floor((timeOutDate - endTime) / 60000);
       if (diffMinutes > 30) {
         overtime = diffMinutes;
-        if (dayOfWeek === 0 || dayOfWeek === 6) {
-          overtimeType = "RDOT";
-        } else {
-          overtimeType = "RGOT";
-        }
+        overtimeType = "RGOT";
+        remarks = remarks || "";
       }
     }
-    undertime = computeUndertime(timeOutDate, schedule.endTime);
+    
+    // Compute undertime only for regular days
+    if (!isRestDay) {
+      undertime = computeUndertime(timeOutDate, schedule.endTime);
+    }
+  }
+  
+  // Set remarks for regular days if not set
+  if (!isRestDay && !remarks && !skipComputation) {
+    if (dayOfWeek === 0) remarks = "SUNDAY";
+    else if (dayOfWeek === 6) remarks = "SATURDAY";
   }
   
   let lateUndertime = "";
   if (late > 0) lateUndertime = `${late} mins`;
-  else if (undertime > 0) lateUndertime = `${undertime} mins`;
+  else if (undertime > 0 && !isRestDay) lateUndertime = `${undertime} mins`;
   
+  // Convert overtime minutes to hours
   const overtimeHours = overtime > 0 ? (overtime / 60).toFixed(2) : "";
   
   record.timeIn = timeInDate ? formatTime(timeInDate) : "";
@@ -234,11 +274,13 @@ function recomputeRecord(record) {
     record.timeOut = timeOutDate ? formatTime(timeOutDate) : "";
   }
   
+  // Set final values
   if (remarks === "NO TIME-OUT") {
     record.overtime = "";
     record.lateUndertime = "";
     record.rgot = "";
     record.rdot = "";
+    record.remarks = remarks;
   } else {
     record.overtime = overtime > 0 ? `${overtime} mins` : "";
     record.lateUndertime = lateUndertime;
@@ -246,20 +288,20 @@ function recomputeRecord(record) {
     if (overtimeType === "RGOT") {
       record.rgot = overtimeHours;
       record.rdot = "";
+      record.remarks = remarks || "";
     } else if (overtimeType === "RDOT") {
       record.rdot = overtimeHours;
       record.rgot = "";
+      record.remarks = remarks;
     } else {
-      if (!record.rgot) record.rgot = "";
-      if (!record.rdot) record.rdot = "";
+      record.rgot = "";
+      record.rdot = "";
+      record.remarks = remarks;
     }
   }
   
-  record.remarks = remarks;
-  
   return record;
 }
-
 // ============================================
 // PARSE BIOMETRICS FILE
 // ============================================
@@ -312,6 +354,7 @@ function parseBiometricsFile(filePath) {
           lateUndertime: "",
           remarks: "",
           employeeType: getEmployeeType(name),
+          position: getEmployeePosition(name),
           paidHoliday: "",
           lastCutoffAdjust: "",
           lwop: "",
@@ -335,7 +378,6 @@ function parseBiometricsFile(filePath) {
       attendance[i].day = getDayOfWeek(attendance[i].date);
     }
     
-    // Sort by name then date - para magkakatabi ang same employee
     attendance.sort((a, b) => {
       if (a.name < b.name) return -1;
       if (a.name > b.name) return 1;
@@ -351,146 +393,16 @@ function parseBiometricsFile(filePath) {
 }
 
 // ============================================
-// DATABASE FUNCTIONS
+// API FUNCTIONS (with saveData after each change)
 // ============================================
 
-// Save attendance to database
-const saveToDatabase = (fileName, attendance) => {
-  return new Promise((resolve, reject) => {
-    db.serialize(() => {
-      // First, delete existing records for this file
-      db.run(`DELETE FROM attendance WHERE file_name = ?`, [fileName], (err) => {
-        if (err) {
-          console.error('Error deleting old records:', err);
-          reject(err);
-        }
-      });
-      
-      // Insert new records
-      const stmt = db.prepare(`INSERT INTO attendance (
-        file_name, employee_name, date, day, time_in, time_out, overtime, 
-        late_undertime, remarks, employee_type, paid_holiday, last_cutoff_adjust,
-        lwop, lwp, rgot, rdot, is_summary
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-      
-      attendance.forEach(record => {
-        stmt.run([
-          fileName,
-          record.name,
-          record.date,
-          record.day || getDayOfWeek(record.date),
-          record.timeIn,
-          record.timeOut,
-          record.overtime,
-          record.lateUndertime,
-          record.remarks,
-          record.employeeType,
-          record.paidHoliday || '',
-          record.lastCutoffAdjust || '',
-          record.lwop || '',
-          record.lwp || '',
-          record.rgot || '',
-          record.rdot || '',
-          record.isSummary ? 1 : 0
-        ], (err) => {
-          if (err) console.error('Error inserting record:', err);
-        });
-      });
-      
-      stmt.finalize();
-      resolve({ success: true, count: attendance.length });
-    });
-  });
-};
-
-// Load attendance from database (sorted by name then date)
-const loadFromDatabase = (fileName) => {
-  return new Promise((resolve, reject) => {
-    db.all(`
-      SELECT 
-        id, 
-        employee_name as name, 
-        date, 
-        day, 
-        time_in as timeIn, 
-        time_out as timeOut,
-        overtime, 
-        late_undertime as lateUndertime, 
-        remarks, 
-        employee_type as employeeType,
-        paid_holiday as paidHoliday, 
-        last_cutoff_adjust as lastCutoffAdjust,
-        lwop, lwp, rgot, rdot, 
-        is_summary as isSummary
-      FROM attendance 
-      WHERE file_name = ?
-      ORDER BY employee_name ASC, date ASC
-    `, [fileName], (err, rows) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve(rows);
-      }
-    });
-  });
-};
-
-// Get all unique file names
-const getAllFileNames = () => {
-  return new Promise((resolve, reject) => {
-    db.all(`
-      SELECT DISTINCT file_name as fileName, COUNT(*) as totalRecords 
-      FROM attendance 
-      GROUP BY file_name 
-      ORDER BY created_at DESC
-    `, [], (err, rows) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve(rows);
-      }
-    });
-  });
-};
-
-// Delete file from database
-const deleteFileFromDB = (fileName) => {
-  return new Promise((resolve, reject) => {
-    db.run(`DELETE FROM attendance WHERE file_name = ?`, [fileName], function(err) {
-      if (err) {
-        reject(err);
-      } else {
-        resolve({ deletedCount: this.changes });
-      }
-    });
-  });
-};
-
-// Delete all files from database
-const deleteAllFilesFromDB = () => {
-  return new Promise((resolve, reject) => {
-    db.run(`DELETE FROM attendance`, function(err) {
-      if (err) {
-        reject(err);
-      } else {
-        resolve({ deletedCount: this.changes });
-      }
-    });
-  });
-};
-
-// ============================================
-// API FUNCTIONS (using Database)
-// ============================================
-
-const getAllFiles = async (req, res) => {
-  try {
-    const files = await getAllFileNames();
-    res.json({ files });
-  } catch (error) {
-    console.error('Error getting files:', error);
-    res.status(500).json({ error: 'Failed to get files' });
-  }
+const getAllFiles = (req, res) => {
+  const files = Array.from(uploadedFiles.keys()).map(key => ({
+    fileName: key,
+    totalRecords: uploadedFiles.get(key).attendance.length,
+    timestamp: uploadedFiles.get(key).timestamp
+  }));
+  res.json({ files });
 };
 
 const uploadAttendance = async (req, res) => {
@@ -502,19 +414,23 @@ const uploadAttendance = async (req, res) => {
     const file = req.files[0];
     const fileName = file.originalname;
     
-    // Check if file already exists
-    const existingFiles = await getAllFileNames();
-    if (existingFiles.some(f => f.fileName === fileName)) {
+    if (uploadedFiles.has(fileName)) {
       return res.status(400).json({ error: `File "${fileName}" already exists.` });
     }
     
     const attendance = parseBiometricsFile(file.path);
     
-    // Save to database
-    await saveToDatabase(fileName, attendance);
+    uploadedFiles.set(fileName, {
+      attendance: attendance,
+      fileName: fileName,
+      timestamp: new Date().toISOString(),
+      totalRecords: attendance.length
+    });
+    
+    saveData();
     
     res.json({
-      message: 'File processed and saved successfully',
+      message: 'File processed successfully',
       fileName: fileName,
       totalRecords: attendance.length,
       attendance: attendance
@@ -526,108 +442,78 @@ const uploadAttendance = async (req, res) => {
   }
 };
 
-const getAttendanceByFile = async (req, res) => {
+const getAttendanceByFile = (req, res) => {
   const { fileName } = req.params;
   const decodedFileName = decodeURIComponent(fileName);
   
-  try {
-    const attendance = await loadFromDatabase(decodedFileName);
-    res.json({
-      fileName: decodedFileName,
-      attendance: attendance,
-      totalRecords: attendance.length,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    console.error('Error loading attendance:', error);
-    res.status(500).json({ error: 'Failed to load attendance' });
+  if (!uploadedFiles.has(decodedFileName)) {
+    return res.status(404).json({ error: 'File not found' });
   }
+  
+  const fileData = uploadedFiles.get(decodedFileName);
+  res.json({
+    fileName: decodedFileName,
+    attendance: fileData.attendance,
+    totalRecords: fileData.totalRecords,
+    timestamp: fileData.timestamp
+  });
 };
 
-const createRecord = async (req, res) => {
+const createRecord = (req, res) => {
   const { fileName } = req.params;
   const { 
     name, date, timeIn, timeOut, overtime, lateUndertime, remarks, employeeType,
     paidHoliday, lastCutoffAdjust, lwop, lwp, rgot, rdot
   } = req.body;
   const decodedFileName = decodeURIComponent(fileName);
+  
+  if (!uploadedFiles.has(decodedFileName)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
   
   if (!name || !date) {
     return res.status(400).json({ error: 'Name and Date are required' });
   }
   
-  try {
-    // Check if record already exists
-    const existing = await new Promise((resolve) => {
-      db.get(`
-        SELECT * FROM attendance 
-        WHERE file_name = ? AND employee_name = ? AND date = ?
-      `, [decodedFileName, name, date], (err, row) => {
-        resolve(row);
-      });
-    });
+  const fileData = uploadedFiles.get(decodedFileName);
+  const newId = fileData.attendance.length > 0 
+    ? Math.max(...fileData.attendance.map(r => r.id)) + 1 
+    : 1;
     
-    if (existing) {
-      return res.status(400).json({ error: 'Record already exists for this employee on this date' });
-    }
-    
-    const day = getDayOfWeek(date);
-    const employeeTypeFinal = employeeType || getEmployeeType(name);
-    
-    let newRecord = {
-      name, date, day, timeIn, timeOut, overtime, lateUndertime, remarks,
-      employeeType: employeeTypeFinal, paidHoliday, lastCutoffAdjust,
-      lwop, lwp, rgot, rdot, isSummary: false
-    };
-    
-    // Recompute if time data exists
-    if (timeIn || timeOut) {
-      const recomputed = recomputeRecord(newRecord);
-      newRecord.timeIn = recomputed.timeIn;
-      newRecord.timeOut = recomputed.timeOut;
-      newRecord.overtime = recomputed.overtime;
-      newRecord.lateUndertime = recomputed.lateUndertime;
-      newRecord.remarks = recomputed.remarks;
-      newRecord.rgot = recomputed.rgot;
-      newRecord.rdot = recomputed.rdot;
-    }
-    
-    // Insert new record
-    await new Promise((resolve, reject) => {
-      db.run(`
-        INSERT INTO attendance (
-          file_name, employee_name, date, day, time_in, time_out, overtime,
-          late_undertime, remarks, employee_type, paid_holiday, last_cutoff_adjust,
-          lwop, lwp, rgot, rdot, is_summary
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `, [
-        decodedFileName, name, date, day, newRecord.timeIn, newRecord.timeOut,
-        newRecord.overtime, newRecord.lateUndertime, newRecord.remarks, employeeTypeFinal,
-        paidHoliday || '', lastCutoffAdjust || '', lwop || '', lwp || '',
-        rgot || '', rdot || '', 0
-      ], function(err) {
-        if (err) reject(err);
-        else resolve(this.lastID);
-      });
-    });
-    
-    // Load all records for this file (automatically sorted by name, date)
-    const allRecords = await loadFromDatabase(decodedFileName);
-    
-    res.json({ 
-      message: 'Record created successfully', 
-      record: newRecord,
-      attendance: allRecords,  // Return sorted records
-      totalRecords: allRecords.length
-    });
-    
-  } catch (error) {
-    console.error('Create error:', error);
-    res.status(500).json({ error: 'Failed to create record' });
+  let newRecord = {
+    id: newId,
+    name,
+    date,
+    day: getDayOfWeek(date),
+    timeIn: timeIn || '',
+    timeOut: timeOut || '',
+    overtime: overtime || '',
+    lateUndertime: lateUndertime || '',
+    remarks: remarks || '',
+    employeeType: employeeType || getEmployeeType(name),
+    position: getEmployeePosition(name),
+    paidHoliday: paidHoliday || '',
+    lastCutoffAdjust: lastCutoffAdjust || '',
+    lwop: lwop || '',
+    lwp: lwp || '',
+    rgot: rgot || '',
+    rdot: rdot || '',
+    isSummary: false
+  };
+  
+  if (newRecord.timeIn || newRecord.timeOut) {
+    newRecord = recomputeRecord(newRecord);
   }
+  
+  fileData.attendance.push(newRecord);
+  fileData.totalRecords = fileData.attendance.length;
+  uploadedFiles.set(decodedFileName, fileData);
+  saveData();
+  
+  res.json({ message: 'Record created successfully', record: newRecord });
 };
 
-const updateRecord = async (req, res) => {
+const updateRecord = (req, res) => {
   const { fileName, recordId } = req.params;
   const { 
     name, date, timeIn, timeOut, overtime, lateUndertime, remarks, employeeType,
@@ -635,124 +521,98 @@ const updateRecord = async (req, res) => {
   } = req.body;
   const decodedFileName = decodeURIComponent(fileName);
   
-  try {
-    // Get existing record
-    const existing = await new Promise((resolve) => {
-      db.get(`SELECT * FROM attendance WHERE id = ? AND file_name = ?`, [recordId, decodedFileName], (err, row) => {
-        resolve(row);
-      });
-    });
-    
-    if (!existing) {
-      return res.status(404).json({ error: 'Record not found' });
-    }
-    
-    const day = getDayOfWeek(date || existing.date);
-    const employeeTypeFinal = employeeType || getEmployeeType(name || existing.employee_name);
-    
-    let updatedRecord = {
-      name: name || existing.employee_name,
-      date: date || existing.date,
-      day: day,
-      timeIn: timeIn !== undefined ? timeIn : existing.time_in,
-      timeOut: timeOut !== undefined ? timeOut : existing.time_out,
-      overtime: overtime !== undefined ? overtime : existing.overtime,
-      lateUndertime: lateUndertime !== undefined ? lateUndertime : existing.late_undertime,
-      remarks: remarks !== undefined ? remarks : existing.remarks,
-      employeeType: employeeTypeFinal,
-      paidHoliday: paidHoliday !== undefined ? paidHoliday : existing.paid_holiday,
-      lastCutoffAdjust: lastCutoffAdjust !== undefined ? lastCutoffAdjust : existing.last_cutoff_adjust,
-      lwop: lwop !== undefined ? lwop : existing.lwop,
-      lwp: lwp !== undefined ? lwp : existing.lwp,
-      rgot: rgot !== undefined ? rgot : existing.rgot,
-      rdot: rdot !== undefined ? rdot : existing.rdot
-    };
-    
-    // Recompute if time changed
-    const timeChanged = (timeIn !== undefined && timeIn !== existing.time_in) ||
-                        (timeOut !== undefined && timeOut !== existing.time_out);
-    
-    if (timeChanged && (updatedRecord.timeIn || updatedRecord.timeOut)) {
-      const recomputed = recomputeRecord(updatedRecord);
-      updatedRecord.timeIn = recomputed.timeIn;
-      updatedRecord.timeOut = recomputed.timeOut;
-      updatedRecord.overtime = recomputed.overtime;
-      updatedRecord.lateUndertime = recomputed.lateUndertime;
-      updatedRecord.remarks = recomputed.remarks;
-      updatedRecord.rgot = recomputed.rgot;
-      updatedRecord.rdot = recomputed.rdot;
-    }
-    
-    await new Promise((resolve, reject) => {
-      db.run(`
-        UPDATE attendance SET
-          employee_name = ?, date = ?, day = ?, time_in = ?, time_out = ?,
-          overtime = ?, late_undertime = ?, remarks = ?, employee_type = ?,
-          paid_holiday = ?, last_cutoff_adjust = ?, lwop = ?, lwp = ?,
-          rgot = ?, rdot = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `, [
-        updatedRecord.name, updatedRecord.date, updatedRecord.day,
-        updatedRecord.timeIn, updatedRecord.timeOut,
-        updatedRecord.overtime, updatedRecord.lateUndertime, updatedRecord.remarks,
-        updatedRecord.employeeType, updatedRecord.paidHoliday, updatedRecord.lastCutoffAdjust,
-        updatedRecord.lwop, updatedRecord.lwp, updatedRecord.rgot, updatedRecord.rdot,
-        recordId
-      ], function(err) {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-    
-    res.json({ message: 'Record updated successfully', record: updatedRecord });
-    
-  } catch (error) {
-    console.error('Update error:', error);
-    res.status(500).json({ error: 'Failed to update record' });
+  if (!uploadedFiles.has(decodedFileName)) {
+    return res.status(404).json({ error: 'File not found' });
   }
+  
+  const fileData = uploadedFiles.get(decodedFileName);
+  const index = fileData.attendance.findIndex(r => r.id == recordId);
+  
+  if (index === -1) {
+    return res.status(404).json({ error: 'Record not found' });
+  }
+  
+  let updatedRecord = {
+    ...fileData.attendance[index],
+    name: name || fileData.attendance[index].name,
+    date: date || fileData.attendance[index].date,
+    day: getDayOfWeek(date || fileData.attendance[index].date),
+    timeIn: timeIn !== undefined ? timeIn : fileData.attendance[index].timeIn,
+    timeOut: timeOut !== undefined ? timeOut : fileData.attendance[index].timeOut,
+    overtime: overtime !== undefined ? overtime : fileData.attendance[index].overtime,
+    lateUndertime: lateUndertime !== undefined ? lateUndertime : fileData.attendance[index].lateUndertime,
+    remarks: remarks !== undefined ? remarks : fileData.attendance[index].remarks,
+    employeeType: employeeType || fileData.attendance[index].employeeType,
+    position: getEmployeePosition(name || fileData.attendance[index].name),
+    paidHoliday: paidHoliday !== undefined ? paidHoliday : fileData.attendance[index].paidHoliday,
+    lastCutoffAdjust: lastCutoffAdjust !== undefined ? lastCutoffAdjust : fileData.attendance[index].lastCutoffAdjust,
+    lwop: lwop !== undefined ? lwop : fileData.attendance[index].lwop,
+    lwp: lwp !== undefined ? lwp : fileData.attendance[index].lwp,
+    rgot: rgot !== undefined ? rgot : fileData.attendance[index].rgot,
+    rdot: rdot !== undefined ? rdot : fileData.attendance[index].rdot
+  };
+  
+  const timeInChanged = timeIn !== undefined && timeIn !== fileData.attendance[index].timeIn;
+  const timeOutChanged = timeOut !== undefined && timeOut !== fileData.attendance[index].timeOut;
+  
+  if (timeInChanged || timeOutChanged) {
+    updatedRecord = recomputeRecord(updatedRecord);
+    updatedRecord.paidHoliday = paidHoliday !== undefined ? paidHoliday : fileData.attendance[index].paidHoliday;
+    updatedRecord.lastCutoffAdjust = lastCutoffAdjust !== undefined ? lastCutoffAdjust : fileData.attendance[index].lastCutoffAdjust;
+    updatedRecord.lwop = lwop !== undefined ? lwop : fileData.attendance[index].lwop;
+    updatedRecord.lwp = lwp !== undefined ? lwp : fileData.attendance[index].lwp;
+  }
+  
+  fileData.attendance[index] = updatedRecord;
+  uploadedFiles.set(decodedFileName, fileData);
+  saveData();
+  
+  res.json({ message: 'Record updated successfully', record: updatedRecord });
 };
 
-const deleteRecord = async (req, res) => {
+const deleteRecord = (req, res) => {
   const { fileName, recordId } = req.params;
   const decodedFileName = decodeURIComponent(fileName);
   
-  try {
-    await new Promise((resolve, reject) => {
-      db.run(`DELETE FROM attendance WHERE id = ? AND file_name = ?`, [recordId, decodedFileName], function(err) {
-        if (err) reject(err);
-        else resolve(this.changes);
-      });
-    });
-    
-    res.json({ message: 'Record deleted successfully' });
-    
-  } catch (error) {
-    console.error('Delete error:', error);
-    res.status(500).json({ error: 'Failed to delete record' });
+  if (!uploadedFiles.has(decodedFileName)) {
+    return res.status(404).json({ error: 'File not found' });
   }
+  
+  const fileData = uploadedFiles.get(decodedFileName);
+  const newAttendance = fileData.attendance.filter(r => r.id != recordId);
+  
+  if (newAttendance.length === fileData.attendance.length) {
+    return res.status(404).json({ error: 'Record not found' });
+  }
+  
+  fileData.attendance = newAttendance;
+  fileData.totalRecords = newAttendance.length;
+  uploadedFiles.set(decodedFileName, fileData);
+  saveData();
+  
+  res.json({ message: 'Record deleted successfully' });
 };
 
-const deleteFile = async (req, res) => {
+const deleteFile = (req, res) => {
   const { fileName } = req.params;
   const decodedFileName = decodeURIComponent(fileName);
   
-  try {
-    await deleteFileFromDB(decodedFileName);
-    res.json({ message: `File "${decodedFileName}" deleted successfully` });
-  } catch (error) {
-    console.error('Delete file error:', error);
-    res.status(500).json({ error: 'Failed to delete file' });
+  if (!uploadedFiles.has(decodedFileName)) {
+    return res.status(404).json({ error: 'File not found' });
   }
+  
+  uploadedFiles.delete(decodedFileName);
+  saveData();
+  
+  res.json({ message: `File "${decodedFileName}" deleted successfully` });
 };
 
-const deleteAllFiles = async (req, res) => {
-  try {
-    const result = await deleteAllFilesFromDB();
-    res.json({ message: 'All files deleted successfully', deletedCount: result.deletedCount });
-  } catch (error) {
-    console.error('Delete all error:', error);
-    res.status(500).json({ error: 'Failed to delete files' });
-  }
+const deleteAllFiles = (req, res) => {
+  const count = uploadedFiles.size;
+  uploadedFiles.clear();
+  saveData();
+  
+  res.json({ message: 'All files deleted successfully', deletedCount: count });
 };
 
 module.exports = {
