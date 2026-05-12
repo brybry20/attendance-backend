@@ -166,19 +166,33 @@ function parseTimeToFullDate(timeStr, dateStr) {
 // ============================================
 // RECOMPUTE FUNCTION
 // ============================================
-
 function recomputeRecord(record) {
   const hasTimeIn = record.timeIn && record.timeIn !== "";
   const hasTimeOut = record.timeOut && record.timeOut !== "";
   
+  const dateObj = new Date(record.date);
+  const dayOfWeek = dateObj.getDay();
+  const isRestDay = dayOfWeek === 0 || dayOfWeek === 6;
+  
+  // SPECIAL CASE: NO TIME-IN at NO TIME-OUT
   if (!hasTimeIn && !hasTimeOut) {
+    // Weekend - mark as SATURDAY or SUNDAY
+    if (isRestDay) {
+      record.remarks = dayOfWeek === 0 ? "SUNDAY" : "SATURDAY";
+    } else {
+      // Weekday with no data - keep blank
+      record.remarks = "";
+    }
+    record.timeIn = "";
+    record.timeOut = "";
+    record.overtime = "";
+    record.lateUndertime = "";
+    record.rgot = "";
+    record.rdot = "";
     return record;
   }
   
-  const dateObj = new Date(record.date);
   const schedule = getSchedule(record.employeeType, dateObj, record.name);
-  const dayOfWeek = dateObj.getDay();
-  const isRestDay = dayOfWeek === 0 || dayOfWeek === 6; // Saturday or Sunday
   
   let timeInDate = null;
   let timeOutDate = null;
@@ -192,7 +206,7 @@ function recomputeRecord(record) {
     timeOutDate = parseTimeToFullDate(record.timeOut, record.date);
   }
   
-  // Check if missing time-out
+  // Check if missing time-out (has time-in but no time-out)
   if (hasTimeIn && !hasTimeOut) {
     remarks = "NO TIME-OUT";
     record.timeOut = "";
@@ -255,8 +269,8 @@ function recomputeRecord(record) {
   
   // Set remarks for regular days if not set
   if (!isRestDay && !remarks && !skipComputation) {
-    if (dayOfWeek === 0) remarks = "SUNDAY";
-    else if (dayOfWeek === 6) remarks = "SATURDAY";
+    // Don't set anything for normal days without issues
+    remarks = "";
   }
   
   let lateUndertime = "";
@@ -296,8 +310,14 @@ function recomputeRecord(record) {
     } else {
       record.rgot = "";
       record.rdot = "";
-      record.remarks = remarks;
+      record.remarks = remarks || "";
     }
+  }
+  
+  // HOLIDAY OVERRIDE
+  const dateObjForHoliday = new Date(record.date);
+  if (dateObjForHoliday.getMonth() === 4 && dateObjForHoliday.getDate() === 1) {
+    record.remarks = "Labor day";
   }
   
   return record;
@@ -306,7 +326,7 @@ function recomputeRecord(record) {
 // PARSE BIOMETRICS FILE
 // ============================================
 
-function parseBiometricsFile(filePath) {
+function parseBiometricsFile(filePath, fileName) {
   try {
     const workbook = XLSX.readFile(filePath);
     const sheetName = workbook.SheetNames[0];
@@ -321,14 +341,17 @@ function parseBiometricsFile(filePath) {
       }
     }
     
-    const attendance = [];
-    let idCounter = 1;
+    // First pass: collect all existing records
+    const existingRecords = [];
+    const allDatesSet = new Set();
+    const allEmployeesSet = new Set();
     
     for (let i = startRow; i < rows.length; i++) {
       const row = rows[i];
       if (!row || row.length < 4) continue;
       
-      const name = row[1];
+      let name = row[1] ? String(row[1]).trim() : "";
+      if (name === "57") name = "Morallos, Carlo";
       const dateTimeStr = row[3];
       
       if (!name || name === "" || name === "Name") continue;
@@ -340,49 +363,177 @@ function parseBiometricsFile(filePath) {
       const date = formatDate(dateTime);
       const time = formatTime(dateTime);
       
-      const existingIndex = attendance.findIndex(a => a.name === name && a.date === date);
+      allDatesSet.add(date);
+      allEmployeesSet.add(name);
+      
+      // Find if record already exists for this employee and date
+      const existingIndex = existingRecords.findIndex(r => r.name === name && r.date === date);
       
       if (existingIndex === -1) {
-        attendance.push({
-          id: idCounter++,
+        existingRecords.push({
           name: name,
           date: date,
-          day: getDayOfWeek(date),
           timeIn: time,
           timeOut: time,
-          overtime: "",
-          lateUndertime: "",
           remarks: "",
-          employeeType: getEmployeeType(name),
-          position: getEmployeePosition(name),
-          paidHoliday: "",
-          lastCutoffAdjust: "",
-          lwop: "",
-          lwp: "",
-          rgot: "",
-          rdot: "",
-          isSummary: false
+          scanCount: 1
         });
       } else {
-        const existing = attendance[existingIndex];
-        const existingTime = parseTimeString(existing.timeOut);
+        const existing = existingRecords[existingIndex];
+        // Update timeIn (earliest) and timeOut (latest)
+        const currentTimeIn = parseTimeString(existing.timeIn);
+        const currentTimeOut = parseTimeString(existing.timeOut);
         const newTime = parseTimeString(time);
         
-        if (newTime > existingTime) existing.timeOut = time;
-        if (parseTimeString(time) < parseTimeString(existing.timeIn)) existing.timeIn = time;
+        if (newTime < currentTimeIn) existing.timeIn = time;
+        if (newTime > currentTimeOut) existing.timeOut = time;
+        existing.scanCount++;
       }
     }
     
+    // Parse date range from filename if possible
+    let startDate, endDate;
+    let foundDateRangeFromFileName = false;
+    
+    if (fileName) {
+      const match = fileName.match(/([a-zA-Z]+)\s*(\d+)\s*-\s*(?:([a-zA-Z]+)\s*)?(\d+)[,\s]+(\d{4})/);
+      if (match) {
+        const monthNames = {
+          january: 0, jan: 0,
+          february: 1, feb: 1,
+          march: 2, mar: 2,
+          april: 3, apr: 3,
+          may: 4,
+          june: 5, jun: 5,
+          july: 6, jul: 6,
+          august: 7, aug: 7,
+          september: 8, sep: 8, sept: 8,
+          october: 9, oct: 9,
+          november: 10, nov: 10,
+          december: 11, dec: 11
+        };
+        
+        const startMonthStr = match[1].toLowerCase();
+        const startDay = parseInt(match[2]);
+        const endMonthStr = match[3] ? match[3].toLowerCase() : startMonthStr;
+        const endDay = parseInt(match[4]);
+        const year = parseInt(match[5]);
+        
+        const startMonthIndex = monthNames[startMonthStr];
+        const endMonthIndex = monthNames[endMonthStr];
+        
+        if (startMonthIndex !== undefined && endMonthIndex !== undefined) {
+          startDate = new Date(year, startMonthIndex, startDay);
+          endDate = new Date(year, endMonthIndex, endDay);
+          foundDateRangeFromFileName = true;
+          console.log(`Extracted date range from filename: ${formatDate(startDate)} to ${formatDate(endDate)}`);
+        }
+      }
+    }
+    
+    if (!foundDateRangeFromFileName) {
+      // Fallback: Get min and max dates from records
+      const allDates = Array.from(allDatesSet).sort();
+      if (allDates.length === 0) {
+        return [];
+      }
+      
+      startDate = new Date(allDates[0]);
+      endDate = new Date(allDates[allDates.length - 1]);
+      
+      // Auto-expand to cover the full week (Monday to Sunday)
+      const startDay = startDate.getDay();
+      const diffToMonday = startDay === 0 ? -6 : 1 - startDay;
+      startDate.setDate(startDate.getDate() + diffToMonday);
+
+      const endDay = endDate.getDay();
+      const diffToSunday = endDay === 0 ? 0 : 7 - endDay;
+      endDate.setDate(endDate.getDate() + diffToSunday);
+    }
+    
+    // Generate all days in the expanded range
+    const allDaysInRange = [];
+    const currentDate = new Date(startDate);
+    
+    while (currentDate <= endDate) {
+      const year = currentDate.getFullYear();
+      const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+      const day = String(currentDate.getDate()).padStart(2, '0');
+      allDaysInRange.push(`${year}-${month}-${day}`);
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+    
+    // Build complete attendance for all employees and all days
+    const attendance = [];
+    let idCounter = 1;
+    const allEmployees = Array.from(allEmployeesSet).sort();
+    
+    for (const employeeName of allEmployees) {
+      for (const date of allDaysInRange) {
+        const existingRecord = existingRecords.find(r => r.name === employeeName && r.date === date);
+        
+        if (existingRecord) {
+          // Has existing record
+          attendance.push({
+            id: idCounter++,
+            name: employeeName,
+            date: date,
+            day: getDayOfWeek(date),
+            timeIn: existingRecord.timeIn,
+            timeOut: existingRecord.timeOut,
+            overtime: "",
+            lateUndertime: "",
+            remarks: "",
+            employeeType: getEmployeeType(employeeName),
+            position: getEmployeePosition(employeeName),
+            paidHoliday: "",
+            lastCutoffAdjust: "",
+            lwop: "",
+            lwp: "",
+            rgot: "",
+            rdot: "",
+            isSummary: false
+          });
+        } else {
+          // No record for this date - create empty record
+          attendance.push({
+            id: idCounter++,
+            name: employeeName,
+            date: date,
+            day: getDayOfWeek(date),
+            timeIn: "",
+            timeOut: "",
+            overtime: "",
+            lateUndertime: "",
+            remarks: "",
+            employeeType: getEmployeeType(employeeName),
+            position: getEmployeePosition(employeeName),
+            paidHoliday: "",
+            lastCutoffAdjust: "",
+            lwop: "",
+            lwp: "",
+            rgot: "",
+            rdot: "",
+            isSummary: false
+          });
+        }
+      }
+    }
+    
+    // Recompute all records
     for (let i = 0; i < attendance.length; i++) {
       attendance[i] = recomputeRecord(attendance[i]);
       attendance[i].day = getDayOfWeek(attendance[i].date);
     }
     
+    // Sort by name then date
     attendance.sort((a, b) => {
       if (a.name < b.name) return -1;
       if (a.name > b.name) return 1;
       return a.date.localeCompare(b.date);
     });
+    
+    console.log(`Generated ${attendance.length} records (${allEmployees.length} employees x ${allDaysInRange.length} days)`);
     
     return attendance;
     
@@ -418,13 +569,14 @@ const uploadAttendance = async (req, res) => {
       return res.status(400).json({ error: `File "${fileName}" already exists.` });
     }
     
-    const attendance = parseBiometricsFile(file.path);
+    const attendance = parseBiometricsFile(file.path, fileName);
     
     uploadedFiles.set(fileName, {
       attendance: attendance,
       fileName: fileName,
       timestamp: new Date().toISOString(),
-      totalRecords: attendance.length
+      totalRecords: attendance.length,
+      dateRemarks: {}
     });
     
     saveData();
@@ -455,7 +607,8 @@ const getAttendanceByFile = (req, res) => {
     fileName: decodedFileName,
     attendance: fileData.attendance,
     totalRecords: fileData.totalRecords,
-    timestamp: fileData.timestamp
+    timestamp: fileData.timestamp,
+    dateRemarks: fileData.dateRemarks || {}
   });
 };
 
@@ -557,10 +710,13 @@ const updateRecord = (req, res) => {
   
   if (timeInChanged || timeOutChanged) {
     updatedRecord = recomputeRecord(updatedRecord);
+    // preserve other fields as they may be overwritten by recomputeRecord
     updatedRecord.paidHoliday = paidHoliday !== undefined ? paidHoliday : fileData.attendance[index].paidHoliday;
     updatedRecord.lastCutoffAdjust = lastCutoffAdjust !== undefined ? lastCutoffAdjust : fileData.attendance[index].lastCutoffAdjust;
     updatedRecord.lwop = lwop !== undefined ? lwop : fileData.attendance[index].lwop;
     updatedRecord.lwp = lwp !== undefined ? lwp : fileData.attendance[index].lwp;
+    updatedRecord.rgot = rgot !== undefined ? rgot : fileData.attendance[index].rgot;
+    updatedRecord.rdot = rdot !== undefined ? rdot : fileData.attendance[index].rdot;
   }
   
   fileData.attendance[index] = updatedRecord;
@@ -568,6 +724,41 @@ const updateRecord = (req, res) => {
   saveData();
   
   res.json({ message: 'Record updated successfully', record: updatedRecord });
+};
+
+// ------- Date Remarks Handlers -------
+// Set or update a remark for a specific date
+const setDateRemark = (req, res) => {
+  const { fileName } = req.params;
+  const { date, remark } = req.body; // expect ISO date string
+  const decodedFileName = decodeURIComponent(fileName);
+
+  if (!uploadedFiles.has(decodedFileName)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  if (!date) {
+    return res.status(400).json({ error: 'Date is required' });
+  }
+
+  const fileData = uploadedFiles.get(decodedFileName);
+  if (!fileData.dateRemarks) fileData.dateRemarks = {};
+  fileData.dateRemarks[date] = remark || '';
+  uploadedFiles.set(decodedFileName, fileData);
+  saveData();
+  res.json({ message: 'Date remark saved', date, remark });
+};
+
+// Retrieve remark for a specific date
+const getDateRemark = (req, res) => {
+  const { fileName, date } = req.params;
+  const decodedFileName = decodeURIComponent(fileName);
+
+  if (!uploadedFiles.has(decodedFileName)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  const fileData = uploadedFiles.get(decodedFileName);
+  const remark = (fileData.dateRemarks && fileData.dateRemarks[date]) || '';
+  res.json({ date, remark });
 };
 
 const deleteRecord = (req, res) => {
@@ -623,5 +814,7 @@ module.exports = {
   updateRecord,
   deleteRecord,
   deleteFile,
-  deleteAllFiles
+  deleteAllFiles,
+  setDateRemark,
+  getDateRemark
 };

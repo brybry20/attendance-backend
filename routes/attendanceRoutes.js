@@ -11,7 +11,9 @@ const {
   updateRecord,
   deleteRecord,
   deleteFile,
-  deleteAllFiles
+  deleteAllFiles,
+  setDateRemark,
+  getDateRemark
 } = require('../controllers/attendanceController');
 
 const router = express.Router();
@@ -51,7 +53,8 @@ router.get('/files', getAllFiles);
 router.post('/upload', upload.any(), uploadAttendance);
 router.get('/files/:fileName', getAttendanceByFile);
 router.delete('/files/:fileName', deleteFile);
-router.delete('/files', deleteAllFiles);
+router.post('/files/:fileName(*)/date-remark', setDateRemark);
+router.get('/files/:fileName(*)/date-remark/:date', getDateRemark);
 
 // Record CRUD per file
 router.post('/files/:fileName/records', createRecord);

@@ -125,8 +125,8 @@ function hasOT(name) {
   // Managers have NO OT
   if (MANAGERS.some(m => cleanName.includes(m))) return false;
   
-  // Supervisors have NO OT
-  if (ALL_SUPERVISORS.some(s => cleanName.includes(s))) return false;
+  // Supervisors have NO OT (except Guerra, Madellyne)
+  if (ALL_SUPERVISORS.some(s => cleanName.includes(s)) && !cleanName.includes("Guerra, Madellyne")) return false;
   
   // Everyone else has OT
   return true;
@@ -155,7 +155,7 @@ function getScheduleForEmployee(name, date) {
   
   // Check for ACCOUNTING SUPERVISOR (Guerra)
   if (SUPERVISORS.accounting.some(a => cleanName.includes(a))) {
-    return { startTime: "08:00", endTime: "17:00", gracePeriod: 15, hasOT: false, position: "Accounting Supervisor" };
+    return { startTime: "08:00", endTime: "17:00", gracePeriod: 15, hasOT: true, position: "Accounting Supervisor" };
   }
   
   // Check for HR SUPERVISOR (Ceniza)
